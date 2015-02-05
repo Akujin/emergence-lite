@@ -932,10 +932,11 @@ class ActiveRecord
             'indexField' => false
             ,'order' => false
             ,'limit' => false
+            ,'calcFoundRows' => false
             ,'offset' => 0
         ));
         
-        $query = 'SELECT * FROM `%s`';
+        $query = 'SELECT '.($options['calcFoundRows'] ? 'SQL_CALC_FOUND_ROWS' : '').'* FROM `%s`';
         $params = array(
             static::$tableName
         );
@@ -949,7 +950,7 @@ class ActiveRecord
         {
             $query .= sprintf(' LIMIT %u,%u', $options['offset'], $options['limit']);
         }
-        
+
         if($options['indexField'])
         {
             return DB::table(static::_cn($options['indexField']), $query, $params, array(static::$rootClass,'handleError'));
@@ -2133,19 +2134,25 @@ class ActiveRecord
     
     static public function handleError($query = null, $queryLog = null, $parameters = null)
     {
-        $_mysqli = DB::getMysqli();
+        $Connection = DB::getConnection();
         
-        if($_mysqli->errno == 1146 && static::$autoCreateTables)
+        if($Connection->errorCode() == 1146 && static::$autoCreateTables)
         {
             static::__classLoaded(); // gotta run this when running from call_user_func :(
             $CreateTable = SQL::getCreateTable(static::$rootClass);
             
-            if(!$success = $_mysqli->multi_query($CreateTable))
-            {
-                $error = $_mysqli->error;
-            }
+            $Statement = $Connection->query($CreateTable);
             
-            return $_mysqli->query($query); // now the query should finish with no error
+			// check for errors
+			$ErrorInfo = $Statement->errorInfo();
+		
+			// handle query error
+			if($ErrorInfo[0] != '00000')
+			{
+				self::handleError($query, $queryLog, $errorHandler);
+			}
+            
+            return $Connection->query($query); // now the query should finish with no error
         }
         else {
             return DB::handleError($query, $queryLog, $parameters);   

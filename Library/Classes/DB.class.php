@@ -11,12 +11,54 @@ class DB
 	static public $encoding = 'UTF-8';
 	static public $charset = 'utf8';
 	
+	static public $defaultLabel = 'mysql';
+	
 	// protected static properties
-	protected static $_mysqli;
+	protected static $Connections = array();
 	protected static $_record_cache = array();
+	protected static $LastStatement;
 	
+	static public function getConnection($label=null)
+	{
+		if(!$label)
+		{
+			$label = static::$defaultLabel;
+		}
 	
-	
+		if(!isset(self::$Connections[$label]))
+		{
+			$config = array_merge(array(
+				'host' => 'localhost'
+				,'port' => 3306
+			), Site::$config[$label]);
+			
+			if($config['socket'])
+			{
+				// socket connection
+				$DSN = 'mysql:unix_socket=' . $config['socket'] . ';dbname=' . $config['database'];
+			}
+			else
+			{
+				// tcp connection
+				$DSN = 'mysql:host=' . $config['host'] . ';port=' . $config['port'] .';dbname=' . $config['database'];
+			}
+			
+			try {
+				// try to initiate connection
+				self::$Connections[$label] = new PDO($DSN, $config['username'], $config['password']);	
+			}
+			catch(PDOException $e)
+			{
+				throw new Exception('Connection failed: ' . $e->getMessage());
+			}
+			
+			// set timezone
+			$q = self::$Connections[$label]->prepare('SET time_zone=?');
+			$q->execute(array(self::$TimeZone));
+		}
+		
+		return self::$Connections[$label];
+	}
 	
 	// public static methods
 	static public function escape($string)
@@ -25,13 +67,15 @@ class DB
 		{
 			foreach($string AS &$sub)
 			{
-				$sub = self::getMysqli()->real_escape_string($sub);
+				$sub = self::getConnection()->quote($sub);
 			}
 		}
 		else
 		{
-			$string = self::getMysqli()->real_escape_string($string);
+			$string = self::getConnection()->quote($string);
 		}
+		
+		$string = substr($string,1,strlen($string)-2);
 		
 		return $string;
 	}
@@ -39,7 +83,7 @@ class DB
 	
 	static public function affectedRows()
 	{
-		return self::getMysqli()->affected_rows;
+		return self::$LastStatement->rowCount();
 	}
 	
 	static public function foundRows()
@@ -50,9 +94,32 @@ class DB
 	
 	static public function insertID()
 	{
-		return self::getMysqli()->insert_id;
+		return self::getConnection()->lastInsertId();
 	}
 	
+	static public function prepareQuery($query, $parameters = array())
+	{
+		return self::preprocessQuery($query, $parameters);
+	}
+	
+	// protected static methods
+	static protected function preprocessQuery($query, $parameters = array())
+	{
+		// MICS::dump(array('query'=>$query,'params'=>$parameters), __FUNCTION__);
+		
+		if ( is_array($parameters) && count($parameters) )
+		{
+			return vsprintf($query, $parameters);
+		}
+		elseif( isset($parameters) )
+		{
+			return sprintf($query, $parameters);
+		}
+		else
+		{
+			return $query;
+		}
+	}
 	
 	static public function nonQuery($query, $parameters = array(), $errorHandler = null)
 	{
@@ -63,19 +130,39 @@ class DB
 		// start query log
 		$queryLog = self::startQueryLog($query);
 		
-		// preprocess and execute query
-		$success = self::getMysqli()->query($query);
+		// execute query
+		$Statement = self::getConnection()->query($query);
 		
-		// handle query error
-		if($success === false)
+		if($Statement)
 		{
-			self::handleError($query, $queryLog, $errorHandler);
+		
+			// check for errors
+			$ErrorInfo = $Statement->errorInfo();
+			
+			// handle query error
+			if($ErrorInfo[0] != '00000')
+			{
+				self::handleError($query, $queryLog, $errorHandler);
+			}
+			
 		}
+		else
+		{
+			// check for errors
+			$ErrorInfo = self::getConnection()->errorInfo();
+			
+			// handle query error
+			if($ErrorInfo[0] != '00000')
+			{
+				self::handleError($query, $queryLog, $errorHandler);
+			}
+		}
+		
+		static::$LastStatement = $Statement;
 		
 		// finish query log
 		self::finishQueryLog($queryLog);
 	}
-	
 	
 	static public function query($query, $parameters = array(), $errorHandler = null)
 	{
@@ -85,18 +172,39 @@ class DB
 		$queryLog = self::startQueryLog($query);
 		
 		// execute query
-		$result = self::getMysqli()->query($query);
+		$Statement = self::getConnection()->query($query);
 		
-		// handle query error
-		if($result === false)
-		{		
-			$result = self::handleError($query, $queryLog, $parameters, $errorHandler);
+		if($Statement)
+		{
+		
+			// check for errors
+			$ErrorInfo = $Statement->errorInfo();
+			
+			// handle query error
+			if($ErrorInfo[0] != '00000')
+			{
+				self::handleError($query, $queryLog, $errorHandler);
+			}
+			
 		}
+		else
+		{
+			// check for errors
+			$ErrorInfo = self::getConnection()->errorInfo();
+			
+			// handle query error
+			if($ErrorInfo[0] != '00000')
+			{
+				self::handleError($query, $queryLog, $errorHandler);
+			}
+		}
+		
+		static::$LastStatement = $Statement;
 		
 		// finish query log
 		self::finishQueryLog($queryLog, $result);
 		
-		return $result;
+		return $Statement;
 	}
 	
 	
@@ -205,13 +313,10 @@ class DB
 		$result = self::query($query, $parameters, $errorHandler);
 		
 		$records = array();
-		while($record = $result->fetch_assoc())
+		while($record = $result->fetch(PDO::FETCH_ASSOC))
 		{
 			$records[] = $record;
 		}
-		
-		// free result
-		$result->free();
 		
 		return $records;
 	}
@@ -270,10 +375,7 @@ class DB
 		}
 		
 		// get record
-		$record = $result->fetch_assoc();
-		
-		// free result
-		$result->free();
+		$record = $result->fetch(PDO::FETCH_ASSOC);
 		
 		// save record to cache
 		if ($cacheKey)
@@ -292,10 +394,7 @@ class DB
 		$result = self::query($query, $parameters, $errorHandler);
 		
 		// get record
-		$record = $result->fetch_assoc();
-		
-		// free result
-		$result->free();
+		$record = $result->fetch(PDO::FETCH_ASSOC);
 		
 		// return record
 		return $record;
@@ -347,31 +446,6 @@ class DB
 	}
 	
 	
-	static public function prepareQuery($query, $parameters = array())
-	{
-		return self::preprocessQuery($query, $parameters);
-	}
-	
-	// protected static methods
-	static protected function preprocessQuery($query, $parameters = array())
-	{
-		// MICS::dump(array('query'=>$query,'params'=>$parameters), __FUNCTION__);
-		
-		if ( is_array($parameters) && count($parameters) )
-		{
-			return vsprintf($query, $parameters);
-		}
-		elseif( isset($parameters) )
-		{
-			return sprintf($query, $parameters);
-		}
-		else
-		{
-			return $query;
-		}
-	}
-	
-	
 	static protected function startQueryLog($query)
 	{
 		if (!Site::$debug)
@@ -408,7 +482,7 @@ class DB
 		// save finish time and number of affected rows
 		$queryLog['time_finish'] = sprintf('%f',microtime(true));
 		$queryLog['time_duration_ms'] = ($queryLog['time_finish'] - $queryLog['time_start']) * 1000;
-		$queryLog['affected_rows'] = self::getMysqli()->affected_rows;
+		//$queryLog['affected_rows'] = self::getConnection()->rowCount();
 		
 		// save result information
 		if($result)
@@ -444,38 +518,6 @@ class DB
 	}
 	
 	
-	static public function getMysqli()
-	{
-		if (!isset(self::$_mysqli))
-		{
-			$config = array_merge(array(
-				'host' => 'localhost'
-				,'port' => 3306
-			), Site::$config['mysql']);
-
-			// connect to mysql database
-			self::$_mysqli = @new mysqli($config['host'], $config['username'], $config['password'], $config['database'], $config['port'], $config['socket']);
-	
-			// check for failure or connection error
-			if (mysqli_connect_error())
-			{
-				self::handleError('connect');
-			}
-			
-			// set timezone
-			if (isset(self::$TimeZone))
-			{
-				self::$_mysqli->query(sprintf(
-					'SET time_zone = "%s"'
-					, self::$_mysqli->real_escape_string(self::$TimeZone)
-				));
-			}
-		}
-		
-		return self::$_mysqli;
-	}
-	
-	
 	static public function handleError($query = '', $queryLog = false, $parameters = null, $errorHandler = null)
 	{
         
@@ -490,7 +532,8 @@ class DB
 		// save queryLog
 		if($queryLog)
 		{
-			$queryLog['error'] = static::$_mysqli->error;
+			$error = static::getConnection()->errorInfo();
+			$queryLog['error'] = $error[2];
 			self::finishQueryLog($queryLog);
 		}
 		
@@ -499,13 +542,14 @@ class DB
 		{
 			$message = mysqli_connect_error();
 		}
-		elseif(static::$_mysqli->errno == 1062)
+		elseif(self::getConnection()->errorCode() == 1062)
 		{
-			throw new DuplicateKeyException(static::$_mysqli->error);
+			throw new DuplicateKeyException(static::getConnection()->errorInfo());
 		}
 		else
 		{
-			$message = static::$_mysqli->error;
+			$error = static::getConnection()->errorInfo();
+			$message = $error[2];
 		}
 		
 		// respond
